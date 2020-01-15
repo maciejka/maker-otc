@@ -35,17 +35,6 @@ contract EventfulMarket {
         uint64            timestamp
     );
 
-    event LogBump(
-        bytes32  indexed  id,
-        bytes32  indexed  pair,
-        address  indexed  maker,
-        ERC20             pay_gem,
-        ERC20             buy_gem,
-        uint128           pay_amt,
-        uint128           buy_amt,
-        uint64            timestamp
-    );
-
     event LogTake(
         bytes32           id,
         bytes32  indexed  pair,
@@ -76,6 +65,11 @@ contract SimpleMarket is EventfulMarket, DSMath {
 
     mapping (uint => OfferInfo) public offers;
 
+    VatLike  public vat = VatLike(0x35D1b3F3D7966A1DFe207aa4514C12a259A0492B);
+    PotLike  public pot = PotLike(0x197E90f9FAD81970bA7976f33CbD77088E5D7cf7);
+    JoinLike public daiJoin = JoinLike(0x9759A6Ac90977b93B58547b4A71c78317f391A28);
+    GemLike  public daiToken = GemLike(0x6B175474E89094C44Da98b954EedeAC495271d0F);
+
     bool locked;
 
     struct OfferInfo {
@@ -85,7 +79,10 @@ contract SimpleMarket is EventfulMarket, DSMath {
         ERC20    buy_gem;
         address  owner;
         uint64   timestamp;
+        uint     pay_pie; // dai/chi
     }
+
+    mapping (uint => OfferInfo) public crumbs;
 
     modifier can_buy(uint id) {
         require(isActive(id));
@@ -125,23 +122,6 @@ contract SimpleMarket is EventfulMarket, DSMath {
 
     // ---- Public entrypoints ---- //
 
-    function bump(bytes32 id_)
-        public
-        can_buy(uint256(id_))
-    {
-        var id = uint256(id_);
-        LogBump(
-            id_,
-            keccak256(offers[id].pay_gem, offers[id].buy_gem),
-            offers[id].owner,
-            offers[id].pay_gem,
-            offers[id].buy_gem,
-            uint128(offers[id].pay_amt),
-            uint128(offers[id].buy_amt),
-            offers[id].timestamp
-        );
-    }
-
     // Accept given `quantity` of an offer. Transfers funds from caller to
     // offer maker, and from market to caller.
     function buy(uint id, uint quantity)
@@ -165,8 +145,21 @@ contract SimpleMarket is EventfulMarket, DSMath {
 
         offers[id].pay_amt = sub(offer.pay_amt, quantity);
         offers[id].buy_amt = sub(offer.buy_amt, spend);
+
+        if (address(pay_gem) == address(daiToken) {
+            uint chi = (now > pot.rho()) ? pot.drip() : pot.chi();
+            uint pie = rdiv(quantity, chi);
+            offers[id].pay_pie = sub(offers[id].pay_pie, pie);
+            pot.exit(pie);
+            daiJoin.exit(msg.sender, quantity);
+            if (offers[id].pay_amt == 0) {
+                crumbs[offers[id].owner] =
+                    add(crumbs[offers[id].owner], offers[id].pay_pie);
+            }
+        } else {
+            require(offer.pay_gem.transfer(msg.sender, quantity) );
+        }
         require( offer.buy_gem.transferFrom(msg.sender, offer.owner, spend) );
-        require( offer.pay_gem.transfer(msg.sender, quantity) );
 
         LogItemUpdate(id);
         LogTake(
@@ -200,7 +193,14 @@ contract SimpleMarket is EventfulMarket, DSMath {
         OfferInfo memory offer = offers[id];
         delete offers[id];
 
-        require( offer.pay_gem.transfer(offer.owner, offer.pay_amt) );
+        if (address(offer.pay_gem) == address(daiToken) {
+            uint chi = (now > pot.rho()) ? pot.drip() : pot.chi();
+            uint pie = add(offer.pay_pie, crumbs[offer.owner]);
+            pot.exit(pie);
+            daiJoin.exit(offer.owner, rmul(chi, pie));
+        } else {
+            require( offer.pay_gem.transfer(offer.owner, offer.pay_amt) );
+        }
 
         LogItemUpdate(id);
         LogKill(
@@ -260,7 +260,15 @@ contract SimpleMarket is EventfulMarket, DSMath {
         id = _next_id();
         offers[id] = info;
 
-        require( pay_gem.transferFrom(msg.sender, this, pay_amt) );
+        if (address(pay_gem) == address(daiToken) {
+            uint chi = (now > pot.rho()) ? pot.drip() : pot.chi();
+            info.pay_pie = rdiv(pay_amt, chi);
+            daiToken.transferFrom(msg.sender, address(this), pay_amt);
+            daiJoin.join(address(this), wad);
+            pot.join(pie);
+        } else {
+            require( pay_gem.transferFrom(msg.sender, this, pay_amt) );
+        }
 
         LogItemUpdate(id);
         LogMake(
@@ -286,5 +294,12 @@ contract SimpleMarket is EventfulMarket, DSMath {
         returns (uint)
     {
         last_offer_id++; return last_offer_id;
+    }
+
+    function wipe() public {
+        uint crumbs = crumbs[msg.sender];
+        uint chi = (now > pot.rho()) ? pot.drip() : pot.chi();
+        pot.exit(crumbs);
+        daiJoin.exit(msg.sender, rmul(chi, crumbs));
     }
 }
